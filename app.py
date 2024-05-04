@@ -1,14 +1,15 @@
-from flask import Flask, jsonify, request
-import psycopg2
-
-import hashlib
-import pyotp
-import random
-import string
-from cryptography.fernet import Fernet
-import time
 import base64
+import hashlib
+import time
+
+import psycopg2
+import pyotp
 from bcrypt import hashpw, gensalt
+from cryptography.fernet import Fernet
+from flask import Flask, request
+
+from create_entropy import generate_entropy, entropy_check
+from random_api import get_random_data
 
 app = Flask(__name__)
 
@@ -35,13 +36,39 @@ def create_totp_generators():
 
     generators = {}
     for user in user_data:
-        generators.update({user[0]: pyotp.TOTP(decrypt_data(user[1], user[2]))})
+        secret_key_bytes = bytes(user[1])
+        symmetric_key_bytes = bytes(user[2])
+        generators.update({user[0]: pyotp.TOTP(decrypt_data(secret_key_bytes, symmetric_key_bytes))})
 
     return generators
 
 
 def add_new_generator(login, secret_key, symmetric_key):
-    generators.update({login: pyotp.TOTP(decrypt_data(secret_key, symmetric_key))})
+    secret_key_bytes = bytes(secret_key)
+    symmetric_key_bytes = bytes(symmetric_key)
+    generators.update({login: pyotp.TOTP(decrypt_data(secret_key_bytes, symmetric_key_bytes))})
+
+
+def generate_secret_key():
+    entropy = generate_entropy()
+
+    if entropy_check(entropy) < 1:
+        print('Энтропия мала, использовано значение с RandomAPI.')
+        entropy = get_random_data()
+    else:
+        print('Энтропии достаточно.')
+
+    random_bytes = entropy.encode('utf-8')
+
+    hasher = hashlib.sha256()
+
+    hasher.update(random_bytes)
+
+    hashed_bytes = hasher.digest()
+
+    secret_key = base64.b32encode(hashed_bytes)
+
+    return secret_key
 
 
 def get_connection():
@@ -52,9 +79,6 @@ def get_connection():
         host="localhost",
         port="5432"
     )
-
-
-generators = create_totp_generators()
 
 
 # sql = """CREATE TABLE users (
@@ -82,9 +106,9 @@ def reg():
     sql = """INSERT INTO users (email, password, symmetric_key, secret_key, auth, salt)
              VALUES (%s, %s, %s, %s, %s, %s);"""
     symmetric_key = Fernet.generate_key()
-    secret_key = encrypt_data(pyotp.random_base32().encode('utf-8'), symmetric_key)
+    secret_key = encrypt_data(bytes(generate_secret_key()), symmetric_key)
     data = (body['email'], hashpw(body['password'].encode('utf-8'), salt), symmetric_key,
-            secret_key, False, salt)
+            secret_key, True, salt)
     cur.execute(sql, data)
 
     conn.commit()
@@ -128,7 +152,25 @@ def auth():
         return 'Acc not found'
 
 
+@app.route('/check_otp', methods=['POST'])
+def check_otp():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    body = request.get_json()
+
+    cur.close()
+    conn.close()
+
+    remaining_time = generators.get(body['email']).interval - (
+            int(time.time()) % generators.get(body['email']).interval)
+
+    return {
+        'totp': generators.get(body['email']).now(),
+        'remaining_time': remaining_time
+    }
 
 
-
-app.run(port=5000)
+if __name__ == '__main__':
+    generators = create_totp_generators()
+    app.run(port=5000)
